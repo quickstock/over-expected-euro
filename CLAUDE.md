@@ -231,9 +231,17 @@ are the leaderboard.
   Full pulls + models run end-to-end; `validate.py` is the gate (all
   checks pass both leagues, six seasons). `cache/` and `euro_oe.db` are
   local artifacts (gitignored).
-- Weekly refresh: `pull.py` both leagues (current-season lists are
-  never cached), rebuild chain, `validate.py`, `export_site_data.py`,
-  rebuild + redeploy site.
+- Weekly refresh: driven by `../site/scripts/weekly_update.sh` (launchd,
+  Mondays), which runs `pull.py --league X --season <current>` for every
+  league (current-season lists are never cached), the rebuild chain,
+  `validate.py`, `export_site_data.py`, `pull_headshots.py`, then the
+  combined site's build, gate and prebuilt deploy. This folder's own
+  `site/` and its `euro-overexpected` deploy are not part of it.
+- **New season checklist:** the season list rolls forward on its own each
+  September, but `config.LBA_CHAMP` is hand-kept (LBA's championship listing
+  omits 2021-22, so it cannot be derived) and needs the new id added; the
+  weekly job emails an LBA pull failure until it is. GBL cannot refresh at
+  all: its ids come from a frozen Wayback manifest, so it stays at 2025-26.
 - An adversarial code review (3 lenses × verify) caught and fixed: the
   EuroLeague xFG leak above; an ACB context-flag backfill that never
   completed (correlated UPDATE → replaced by the `possession_shot_flags`

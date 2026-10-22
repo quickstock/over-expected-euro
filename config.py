@@ -53,9 +53,13 @@ EL_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 LBA_API = "https://www.legabasket.it"
 # Lega Basket Serie A regular-season championship id per season (from
 # /api/championships/get-championships?cs_id=1, ctype_code == "RS").
+# Hand-kept: that listing is paginated and omits 2021-22, so it cannot be
+# derived. Each new season needs its id added here (the weekly job emails a
+# pull failure until it is).
 LBA_CHAMP = {
     "2020-21": 221, "2021-22": 429, "2022-23": 466,
     "2023-24": 530, "2024-25": 567, "2025-26": 596,
+    "2026-27": 602,
 }
 
 # ABA Liga (Adriatic): aba-liga.com season code = 2-digit start year.
