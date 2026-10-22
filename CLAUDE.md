@@ -26,7 +26,8 @@ python3 pull.py --league EL          # network -> cache/ (idempotent)
 python3 pull.py --league ACB
 python3 build_tables.py              # cache -> euro_oe.db base tables
 python3 build_possessions.py         # events -> possessions + sfta
-python3 train_xfta.py                # Poisson GLM cross-fit -> FTAOE board
+python3 build_diet_expected.py       # shot-diet expected FTs -> diet_game (FTAOE baseline)
+python3 train_xfta.py                # context GLM (team/ref views) + FTAOE board from diet_game
 python3 shot_value.py                # LightGBM xFG + shot-value suite
 python3 validate.py                  # the gate — run before trusting results
 
@@ -125,6 +126,18 @@ vercel --prod --yes                  # deploy (run from site/)
   here they are in. Technical / unsportsmanlike / bench FTs are
   excluded; and-1s detected via made FG by the same player at the same
   clock (±2 s). The stat reads "free throws drawn over expected".
+- **FTAOE's baseline is shot diet since 2026-10-22** (`build_diet_expected.py`):
+  league FTs per attempt by zone (rim, paint, mid, three), fouled misses
+  counted back in as attempts, leave-player-out, anchored per season. The
+  context GLM (bonus, margin, home, opponent, crew) explained too little to
+  separate players, so FTAOE on it was r 0.96-0.98 with the raw rate; on shot
+  diet it is r 0.58-0.72. **Known limit:** FIBA pbp cannot tell a bonus pair
+  from a fouled miss, so 2-shot trips (59% of them in the bonus) count as
+  fouled 2-pt attempts, which tilts the baseline slightly against tall
+  finishers (height r -0.23 EL, -0.25 EUC). Splitting bonus trips out was
+  measured and rejected: the bonus half goes unadjusted and r with the raw
+  rate climbs back to ~0.91. Calibration is a little flatter than the
+  diagonal at both ends for the same reason.
 - **`in_bonus` is real** (defense ≥ 4 counted team fouls in the quarter,
   OT extends Q4, derived from the foul stream) — an upgrade over the
   NBA's period≥4 proxy.
@@ -162,6 +175,7 @@ vercel --prod --yes                  # deploy (run from site/)
 
 `games, events, shots, player_season, player_season_ft` (build_tables) →
 `possessions, and1_shots, possession_shot_flags` (build_possessions) →
+`diet_game, diet_rates` (build_diet_expected) →
 `predictions_poss, player_season_xfta_lb` (train_xfta) →
 `shots_xfg, shot_value, player_game_shot_value, team_shot_value`
 (shot_value). The headline table is `shot_value`; `qualified = 1` rows

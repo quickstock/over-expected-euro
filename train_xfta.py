@@ -131,13 +131,20 @@ def _poisson_deviance(y, mu):
 
 
 def build_leaderboard(con, league, preds):
+    """FTAOE board: actual drawn FTs minus the shot-diet expectation
+    (diet_game, from build_diet_expected.py). The context predictions made
+    here feed the team and referee views, not the player board."""
     lb = (preds[preds.finisher_player_id.notna()]
           .groupby(["season", "finisher_player_id"])
           .agg(possessions=("sfta", "size"),
-               actual_fta_from_fouls=("sfta", "sum"),
-               xfta_total=("xfta", "sum"))
+               actual_fta_from_fouls=("sfta", "sum"))
           .reset_index()
           .rename(columns={"finisher_player_id": "player_id"}))
+    diet = pd.read_sql(
+        "SELECT season, player_id, SUM(xft) AS xfta_total FROM diet_game "
+        "WHERE league = ? GROUP BY season, player_id", con, params=(league,))
+    lb = lb.merge(diet, on=["season", "player_id"], how="left")
+    lb["xfta_total"] = lb["xfta_total"].fillna(0.0)
     lb["ftaoe"] = lb.actual_fta_from_fouls - lb.xfta_total
     lb["ftaoe_per_100"] = lb.ftaoe / lb.possessions * 100
     lb["qualified"] = (lb.possessions >= config.QUALIFY_POSS).astype(int)

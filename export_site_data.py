@@ -167,18 +167,22 @@ def export_league(league):
     qual_keys = set(zip(lb.loc[q, "player_id"], lb.loc[q, "season"]))
 
     per_game = pd.read_sql(
-        """SELECT p.finisher_player_id AS player_id, p.season, p.game_id,
-                  SUM(p.sfta) AS actual, SUM(pr.xfta) AS xfta,
-                  COUNT(*) AS poss
-           FROM possessions p
-           JOIN games g ON g.league = p.league AND g.game_id = p.game_id
-           JOIN predictions_poss pr
-             ON pr.league = p.league AND pr.game_id = p.game_id
-            AND pr.possession_number = p.possession_number
-           WHERE p.league = ? AND p.finisher_player_id IS NOT NULL
-           GROUP BY p.finisher_player_id, p.season, p.game_id
-           ORDER BY g.date, p.game_id""",
-        conn, params=(league,))
+        """SELECT pg.player_id, pg.season, pg.game_id, pg.actual,
+                  COALESCE(d.xft, 0) AS xfta, pg.poss
+           FROM (SELECT p.finisher_player_id AS player_id, p.season,
+                        p.game_id, SUM(p.sfta) AS actual, COUNT(*) AS poss,
+                        g.date
+                 FROM possessions p
+                 JOIN games g ON g.league = p.league AND g.game_id = p.game_id
+                 WHERE p.league = ? AND p.finisher_player_id IS NOT NULL
+                 GROUP BY p.finisher_player_id, p.season, p.game_id) pg
+           -- expected FTs per game from the shot-diet baseline, so a
+           -- player's games sum to his season
+           LEFT JOIN diet_game d
+             ON d.league = ? AND d.game_id = pg.game_id
+            AND d.player_id = pg.player_id
+           ORDER BY pg.date, pg.game_id""",
+        conn, params=(league, league))
 
     pgfg = pd.read_sql(
         "SELECT player_id, game_id, season, act_fg_pts, exp_fg_pts "
@@ -285,10 +289,17 @@ def export_league(league):
             AND p.possession_number = pr.possession_number
            WHERE pr.league = ? AND p.finisher_player_id IS NOT NULL""",
         conn, params=(league,))
-    pred["bin"] = pd.qcut(pred["xfta"], 10, duplicates="drop")
-    cal = (pred.groupby("bin", observed=True)
-           .agg(pred_mean=("xfta", "mean"), actual_mean=("sfta", "mean"),
-                n=("sfta", "size"))
+    # calibration of the FTAOE baseline at the grain it is used: qualified
+    # player-seasons in deciles of expected FTs per possession (shot diet)
+    # against actual; `pred` (context model) still supplies the league rates
+    cq_cal = lb[q].assign(
+        exp_rate=lambda d: d.xfta_total / d.possessions,
+        act_rate=lambda d: d.actual_fta_from_fouls / d.possessions)
+    cq_cal["bin"] = pd.qcut(cq_cal["exp_rate"], 10, duplicates="drop")
+    cal = (cq_cal.groupby("bin", observed=True)
+           .agg(pred_mean=("exp_rate", "mean"),
+                actual_mean=("act_rate", "mean"),
+                n=("exp_rate", "size"))
            .reset_index(drop=True))
     calibration = [
         {"pred": round(r.pred_mean, 4), "actual": round(r.actual_mean, 4),
@@ -487,6 +498,22 @@ def export_league(league):
                   fg_pts_oe_per100, ft_pct, ftaoe, points_oe_per100
            FROM shot_value WHERE league = ? AND possessions >= ?""",
         conn, params=(league, QUALIFY))
+    # EuroLeague projection for domestic leagues (build_translation.py)
+    tr = pd.read_sql(
+        "SELECT season, player_id, el_proj, el_lo, el_hi, el_actual, el_fga "
+        "FROM translation WHERE league = ?", conn, params=(league,))
+    tr_by_key = {(r.player_id, r.season): r for r in tr.itertuples()}
+
+    def el_fields(pid, season):
+        t = tr_by_key.get((pid, season))
+        if t is None:
+            return {}
+        out = {"elProj": round(t.el_proj, 1), "elLo": round(t.el_lo, 1),
+               "elHi": round(t.el_hi, 1)}
+        if pd.notna(t.el_actual):
+            out.update(elActual=round(t.el_actual, 1), elFga=int(t.el_fga))
+        return out
+
     shot_value_out = {}
     for season, grp in sv.groupby("season"):
         rows = [
@@ -505,6 +532,7 @@ def export_league(league):
                 "ftPct": round(r.ft_pct, 3),
                 "ftaoe100": round(r.ftaoe / r.possessions * 100, 1),
                 "poe100": round(r.points_oe_per100, 2),
+                **el_fields(r.player_id, season),
             }
             for r in grp.itertuples()
         ]
@@ -545,6 +573,27 @@ def export_league(league):
     yoy_mean = round(float(np.mean([p["r"] for p in yoy_pairs])), 3) \
         if yoy_pairs else None
 
+    # what the shot-diet baseline does and does not take out, on the
+    # qualified rows as shipped (heights exist for EL and EuroCup only)
+    cq = qlb.merge(pd.read_sql(
+        "SELECT season, player_id, height_cm FROM player_season "
+        "WHERE league = ?", conn, params=(league,)).drop_duplicates(
+            ["season", "player_id"]), on=["season", "player_id"], how="left")
+    cq["raw100"] = cq.actual_fta_from_fouls / cq.possessions * 100
+    has_h = cq.height_cm.notna().sum() > 50
+    confounds = {
+        "rawRateCorr": round(float(cq.ftaoe_per_100.corr(cq.raw100)), 3),
+        "heightCorr": round(float(cq.ftaoe_per_100.corr(cq.height_cm)), 3)
+        if has_h else None,
+        "rawHeightCorr": round(float(cq.raw100.corr(cq.height_cm)), 3)
+        if has_h else None,
+    }
+    rates = pd.read_sql("SELECT season, zone, rate FROM diet_rates "
+                        "WHERE league = ?", conn, params=(league,))
+    diet_rates = {
+        season: {r.zone: round(float(r.rate), 3) for r in grp.itertuples()}
+        for season, grp in rates.groupby("season")}
+
     # league FT% (all free throws), FTA-weighted actual
     lf = pd.read_sql(
         "SELECT SUM(ftm) AS m, SUM(fta) AS a FROM player_season_ft "
@@ -576,7 +625,13 @@ def export_league(league):
             "yoyMeanR": yoy_mean,
             "yoyPairs": yoy_pairs,
         },
+        "confounds": confounds,
+        "dietRates": diet_rates,
     }
+    tm = conn.execute("SELECT meta FROM translation_meta WHERE league = ?",
+                      (league,)).fetchone()
+    if tm:
+        meta["translation"] = json.loads(tm[0])
 
     out = {
         "meta": meta,
