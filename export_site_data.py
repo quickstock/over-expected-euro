@@ -17,18 +17,41 @@ artifacts.
 import json
 import re
 import sqlite3
+import unicodedata
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 import config
+import referees
 
 OUT_DIR = Path(__file__).parent / "site" / "public"
 QUALIFY = config.QUALIFY_POSS
 QUALIFY_REF_GAMES = 15
-QUARTER_ORDER = ["Q1", "Q2", "Q3", "Q4", "OT"]
-SCRIPT_ORDER = ["close", "mid", "blowout"]
+
+# Greek to Latin, longest first, the way the GBL feed spells officials in Latin
+# script ("Πέτρος Παπαπέτρου" / "Petros Papapetrou").
+_GREEK = [("ου", "ou"), ("θ", "th"), ("χ", "ch"), ("ψ", "ps"), ("α", "a"),
+          ("β", "v"), ("γ", "g"), ("δ", "d"), ("ε", "e"), ("ζ", "z"), ("η", "i"),
+          ("ι", "i"), ("κ", "k"), ("λ", "l"), ("μ", "m"), ("ν", "n"), ("ξ", "x"),
+          ("ο", "o"), ("π", "p"), ("ρ", "r"), ("σ", "s"), ("ς", "s"), ("τ", "t"),
+          ("υ", "y"), ("φ", "f"), ("ω", "o")]
+
+
+def ref_key(name: str) -> str:
+    """An official's id: the slugged name, since no feed carries an id. GBL
+    lists the same officials in Greek in some games and in Latin in others, and
+    the slug kept only a-z and 0-9, so every Greek spelling became the same
+    empty id: 139 of 222 GBL names merged into one "official". Greek is now
+    transliterated first, so both spellings of a person land on one id. Names
+    without Greek letters are untouched, so no other league's URLs move."""
+    s = name.lower()
+    if any("\u0370" <= c <= "\u03ff" for c in s):
+        s = "".join(c for c in unicodedata.normalize("NFD", s) if not unicodedata.combining(c))
+        for g, latin in _GREEK:
+            s = s.replace(g, latin)
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
 
 conn = sqlite3.connect(config.DB_PATH)
 
@@ -319,7 +342,11 @@ def export_league(league):
         lift_n += len(grp)
 
     # ------------------------------------------------ referees + teams
-    ref_base = pd.read_sql(
+    # Officials over the expected whistle of the games they worked (shot
+    # diet plus the players on the floor), shrunk to what the data supports:
+    # referees.py, mirrored from the NBA pipeline. Keyed by name (no stable id
+    # in these feeds), slugged.
+    ref_poss = pd.read_sql(
         """WITH ls AS (
                SELECT game_id, ABS(score_margin) AS m,
                       ROW_NUMBER() OVER (
@@ -336,89 +363,30 @@ def export_league(league):
                FROM ls WHERE rn = 1
            )
            SELECT p.game_id, p.period, p.sfta, p.season, fm.bucket,
-                  g.ref1, g.ref2, g.ref3
+                  p.finisher_player_id AS pid
            FROM possessions p
-           JOIN games g ON g.league = p.league AND g.game_id = p.game_id
            JOIN fm ON fm.game_id = p.game_id
            WHERE p.league = ?""",
         conn, params=(league, league))
-    ref_base["q"] = np.where(ref_base["period"] <= 4,
-                             "Q" + ref_base["period"].astype(int).astype(str),
+    ref_poss["q"] = np.where(ref_poss["period"] <= 4,
+                             "Q" + ref_poss["period"].astype(int).astype(str),
                              "OT")
-
-    lg_season = ref_base.groupby("season")["sfta"].mean() * 100
-    lg_quarter = ref_base.groupby(["season", "q"])["sfta"].mean() * 100
-    lg_script = ref_base.groupby(["season", "bucket"])["sfta"].mean() * 100
-
-    parts = []
-    for n in (1, 2, 3):
-        sub = ref_base[["game_id", "season", "q", "bucket", "sfta"]].copy()
-        sub["ref"] = ref_base[f"ref{n}"]
-        parts.append(sub[sub["ref"].notna()])
-    refl = pd.concat(parts, ignore_index=True)
-    refl["ref_id"] = refl["ref"].map(
-        lambda s: re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-"))
-    ref_name = refl.groupby("ref_id")["ref"].agg(lambda s: s.mode().iat[0])
-
-    head = (refl.groupby(["ref_id", "season"])
-            .agg(games=("game_id", "nunique"), poss=("sfta", "size"),
-                 fta=("sfta", "sum")).reset_index())
-    head["per100"] = head["fta"] / head["poss"] * 100
-    qg = (refl.groupby(["ref_id", "season", "q"])
-          .agg(poss=("sfta", "size"), fta=("sfta", "sum")).reset_index())
-    qg["per100"] = qg["fta"] / qg["poss"] * 100
-    sg = (refl.groupby(["ref_id", "season", "bucket"])
-          .agg(games=("game_id", "nunique"), poss=("sfta", "size"),
-               fta=("sfta", "sum")).reset_index())
-    sg["per100"] = sg["fta"] / sg["poss"] * 100
-
-    referees_out = {}
-    for season, grp in head.groupby("season"):
-        rows = []
-        for r in grp.itertuples():
-            if r.games < QUALIFY_REF_GAMES:
-                continue
-            lg = float(lg_season[season])
-            rows.append({"id": r.ref_id, "name": ref_name[r.ref_id],
-                         "games": int(r.games),
-                         "per100": round(r.per100, 2),
-                         "diff": round(r.per100 - lg, 2)})
-        rows.sort(key=lambda x: -x["diff"])
-        referees_out[season] = rows
-
-    qg_g = qg.groupby(["ref_id", "season"])
-    sg_g = sg.groupby(["ref_id", "season"])
-    ref_profiles: dict = {}
-    for r in head.itertuples():
-        if r.games < QUALIFY_REF_GAMES:
-            continue
-        rid, season = r.ref_id, r.season
-        prof = ref_profiles.setdefault(
-            rid, {"name": ref_name[rid], "seasons": [], "detail": {}})
-        prof["seasons"].append(season)
-        qmap = {x.q: x for x in qg_g.get_group((rid, season)).itertuples()}
-        quarters = [
-            {"q": qq, "poss": int(qmap[qq].poss),
-             "per100": round(qmap[qq].per100, 2),
-             "lg": round(float(lg_quarter[(season, qq)]), 2)}
-            for qq in QUARTER_ORDER if qq in qmap
-        ]
-        smap = {x.bucket: x for x in sg_g.get_group((rid, season))
-                .itertuples()}
-        script = [
-            {"b": b, "games": int(smap[b].games), "poss": int(smap[b].poss),
-             "per100": round(smap[b].per100, 2),
-             "lg": round(float(lg_script[(season, b)]), 2)}
-            for b in SCRIPT_ORDER if b in smap
-        ]
-        prof["detail"][season] = {
-            "games": int(r.games), "poss": int(r.poss), "fta": int(r.fta),
-            "per100": round(r.per100, 2),
-            "lg": round(float(lg_season[season]), 2),
-            "quarters": quarters, "script": script,
-        }
-    for prof in ref_profiles.values():
-        prof["seasons"] = sorted(prof["seasons"])
+    ref_diet = pd.read_sql(
+        "SELECT game_id, player_id AS pid, xft FROM diet_game WHERE league = ?",
+        conn, params=(league,))
+    _g = pd.read_sql("SELECT game_id, ref1, ref2, ref3 FROM games WHERE league = ?",
+                     conn, params=(league,))
+    ref_games = pd.concat(
+        [_g[["game_id", f"ref{n}"]].set_axis(["game_id", "ref_name"], axis=1)
+         for n in (1, 2, 3)], ignore_index=True)
+    ref_games = ref_games[ref_games.ref_name.notna() & (ref_games.ref_name != "")]
+    ref_games["ref_id"] = ref_games.ref_name.map(ref_key)
+    # display a person's Latin spelling where the feed has one
+    latin = ref_games[ref_games.ref_name.map(lambda n: n.isascii())]
+    shown = latin.groupby("ref_id").ref_name.agg(lambda n: n.mode().iat[0])
+    ref_games["ref_name"] = ref_games.ref_id.map(shown).fillna(ref_games.ref_name)
+    referees_out, ref_profiles, referees_meta = referees.build(
+        ref_poss, ref_diet, ref_games, qualify_games=QUALIFY_REF_GAMES)
 
     tm = pd.read_sql(
         """SELECT p.season, p.offense_team_id, p.sfta, pr.xfta,
@@ -627,6 +595,7 @@ def export_league(league):
         },
         "confounds": confounds,
         "dietRates": diet_rates,
+        "referees": referees_meta,
     }
     tm = conn.execute("SELECT meta FROM translation_meta WHERE league = ?",
                       (league,)).fetchone()
