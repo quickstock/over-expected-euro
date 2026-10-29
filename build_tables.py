@@ -106,12 +106,24 @@ def build_league(league, con):
                       for e in events}
             for s in shots:
                 s["league"], s["season"] = league, season
-                s["distance_m"] = math.hypot(s["x_m"], s["y_m"])
-                s["angle_deg"] = math.degrees(
-                    math.atan2(abs(s["x_m"]), s["y_m"]))
-                s["zone_basic"] = zone_basic(s["x_m"], s["y_m"],
+                if s["y_m"] is None:
+                    # Depth unknown but at or below the hoop line (ACB
+                    # clamps it there). Distance and angle stay unknown.
+                    # Zones are cut at the bound y = 0: below the line
+                    # every zone is fixed by x alone except restricted
+                    # area vs paint within 1.25 m, and in the leagues that
+                    # report below-line depth 97.7% of those 2PA are in
+                    # the restricted area, which is what y = 0 gives.
+                    s["distance_m"] = s["angle_deg"] = None
+                    y_zone = 0.0
+                else:
+                    s["distance_m"] = math.hypot(s["x_m"], s["y_m"])
+                    s["angle_deg"] = math.degrees(
+                        math.atan2(abs(s["x_m"]), s["y_m"]))
+                    y_zone = s["y_m"]
+                s["zone_basic"] = zone_basic(s["x_m"], y_zone,
                                              s["shot_value"])
-                s["zone_area"] = zone_area(s["x_m"], s["y_m"])
+                s["zone_area"] = zone_area(s["x_m"], y_zone)
                 s["shot_type"] = f"{s['shot_value']}pt"
                 m = margin.get(s["event_id"], 0)
                 is_home = s["team_id"] == g["home_team_id"]

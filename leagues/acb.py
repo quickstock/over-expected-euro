@@ -179,14 +179,24 @@ def normalize_game(season, game):
         if not bucket:
             continue  # orphan shotPoint; possession side still counts the FGA
         ev, dunk = bucket.pop(0)  # consume in order; distinct events, distinct rows
+        # posX = toward midcourt, posY = lateral, both mm from hoop.
+        # Every dunk comes at (0,0), the rim, which is where a dunk is; any
+        # other shot at (0,0) has no location (56 in 245k) and gets no row.
+        # The feed clamps depth at the hoop line: posX is never negative,
+        # and a shot below the line (half of all corner threes, baseline
+        # drives) arrives as exactly 0 beside its real lateral posY. Its
+        # depth is unknown, not 0, so y_m is None; build_tables zones it
+        # from the bound.
+        pos_x, pos_y = s["posX"], s["posY"]
+        if pos_x == 0 and pos_y == 0 and not dunk:
+            continue
         shots.append({
             "game_id": gid, "event_id": ev["event_id"],
             "player_id": ev["player_id"], "team_id": ev["team_id"],
             "period": ev["period"], "secs_remaining": ev["secs_remaining"],
             "shot_made": ev["shot_made"], "shot_value": ev["shot_value"],
-            # posX = toward midcourt, posY = lateral, both mm from hoop
-            "x_m": (s.get("posY") or 0) / 1000.0,
-            "y_m": (s.get("posX") or 0) / 1000.0,
+            "x_m": pos_y / 1000.0,
+            "y_m": None if pos_x == 0 and pos_y != 0 else pos_x / 1000.0,
             "second_chance": 0,       # derived later in build_possessions
             "off_turnover": 0,        # derived later in build_possessions
             "dunk": dunk,

@@ -80,6 +80,14 @@ vercel --prod --yes                  # deploy (run from site/)
   `subphaseId == null`. Team identity across seasons is `clubId`.
   Editions: 85 = 2020-21 ... 90 = 2025-26. Unofficial access — be
   polite (`ACB_SLEEP >= 0.8`), cache aggressively.
+  **Shot depth is clamped at the hoop line.** `posX` (mm toward midcourt)
+  is never negative in 245k shots; a shot below the line arrives as exactly
+  0 beside its real lateral `posY` (continuous density from 1 mm up, a pile
+  at 0, nothing under it; ~half of all corner threes). That depth is
+  unknown, so `y_m`, `distance_m` and `angle_deg` are NULL for those rows
+  (~7% of shots) and zones are cut at the bound y = 0 (see Decisions).
+  Every dunk comes at (0,0), the rim, and stays there; a non-dunk at (0,0)
+  has no location and gets no shot row.
 - **Lega Basket Serie A** (league code `LBA`, Italy): legabasket.it's own
   open JSON API (`leagues/lba.py`). `championships/get-championships` →
   regular-season championship id per season (`config.LBA_CHAMP`);
@@ -96,6 +104,12 @@ vercel --prod --yes                  # deploy (run from site/)
   `/games/{id}` → refs. **Only 2023-24+ (`config.BBL_MIN_SEASON`)**: the
   SCB feed didn't tag the shooter on missed shots / 2nd+ free throws
   before then, which breaks per-player shot value.
+  **Coordinates:** a half-court grid, x 0-280 sideline to sideline (the
+  league site draws shots in a 460x280 full-court frame), so 18.667
+  units/m on both axes, hoop at (140, 29.4), baseline at y = 0. The
+  frame is identical in every cached season 2020-21 to 2026-27. Only
+  shots carry coordinates; (0,0) is a no-location sentinel and 15 in 120k
+  are tapped past the sideline, and neither gets a shot row.
 - **Genius FIBA LiveStats** (`leagues/genius.py`, uniform for any league on
   the platform): `fibalivestats.dcd.shared.geniussports.com/data/{id}/
   data.json` — pbp + per-team `shot` arrays (x/y join on `actionNumber`).
@@ -145,6 +159,21 @@ vercel --prod --yes                  # deploy (run from site/)
   6.60 m to y = 1.415 m above the hoop line, RA 1.25 m). Both leagues
   normalized to meters from hoop center, x lateral / y toward midcourt
   (ACB's native axes are swapped and in mm; EuroLeague's are in cm).
+  **A NULL `y_m` means "at or below the hoop line, depth unknown"** (only
+  ACB produces it). `build_tables` cuts zones at the bound y = 0: below
+  the line every zone is fixed by x alone except restricted area vs paint
+  within 1.25 m laterally, and in the leagues that do report below-line
+  depth 97.7% of those 2PA are restricted-area shots (95-100% within 1 m,
+  60-88% at 1.0-1.25 m), which is what the bound gives. Distance and
+  angle stay NULL; LightGBM takes the NaN natively, and `export_shots.py`'s
+  `y_m < 14` filter leaves those shots out of the homepage picture.
+- **Checking a league's coordinate frame:** the 3PA inner edge should sit
+  just past the 6.60 m corner line and the 6.75 m arc (EuroLeague: +0.075 m
+  in the corner, +0.19 m at the top; every metric-native league is 0.1-0.2 m
+  further out at the top than in the corner), corner threes should start
+  ~0.8-0.9 m above the baseline (p01 of depth around -0.8 m), and nothing
+  should fall past |x| = 7.5 m. A 2pt/3pt agreement fit cannot pin a scale:
+  players avoid the line, so 99.7% agreement holds across a 7% range.
 - **No NBA-style `action_type`.** Context flags instead: EL has native
   fastbreak / second-chance / off-turnover per shot; ACB gets dunk from
   playType and second-chance / off-turnover derived from possessions.
@@ -235,6 +264,31 @@ are the leaderboard.
 
 ## State
 
+- **2026-10-24: BBL and ACB shot coordinates fixed at the source**, made
+  visible by the homepage hero (`../site/src/components/ShotCloud.tsx`).
+  Rebuilt BBL and ACB through the chain, then translation, `validate.py`,
+  the exports and `sync_data.py`. Not deployed.
+  - **BBL was stretched 7%.** One 17.5 units/m scale and a hoop at y = 34
+    came from a 2pt/3pt separation fit, which cannot pin a scale (99.7%
+    agreement either way). Now 18.667 units/m on both axes from the frame
+    itself (x 0-280 = 15 m), hoop at (140, 29.4). Corner threes went from
+    |x| median 7.49 m to 7.02 (p10 6.75; ACB/ABA/GBL 6.98-6.99, LBA 7.05,
+    WNBA 7.07, EL 6.83), top-of-arc threes 7.66 m to 7.43 (EL 7.40), 3.2%
+    of shots past the sideline to none. Zones: restricted area -1.8 pp
+    (21.2% to 19.4%), paint +2.4 pp, mid-range -0.6 pp.
+  - **ACB depth was clamped, not missing.** 15,939 shots (~7%) now carry a
+    NULL depth instead of 0; 49 non-dunk (0,0) shots lost their row. Zone
+    shares did not move (by construction, see Decisions); the change is in
+    distance/angle as model features and in the picture, which no longer
+    draws a row on the hoop line (it now draws nothing below it).
+  - **Boards barely moved:** rank r 0.997-1.000 every season on points over
+    expected, shot-making and FTAOE in both leagues; median |change| 0.2-0.3
+    per 100, max ~2. Same 2025-26 top 10s, a few adjacent swaps. The
+    EuroLeague translation refit by a hair (steps unchanged to 0.01, RMSE
+    4.423 vs flat 4.782), which nudges LBA/ABA/GBL `elLo/elHi` by 0.1 pp.
+  - Not fixed, seen on the way: 420 ABA threes (0.64% of its 3PA) sit
+    beside the hoop (mean |x| 1.1 m, y 0.4 m), against 0.05% elsewhere:
+    probably a placeholder location in the shooting-chart feed.
 - **2026-07-13: EuroCup + WNBA added**, both full 6-season pull → build →
   model → validate chains clean (`validate.py` gate passes all eight
   leagues). See the Data sources section above for both adapters and the

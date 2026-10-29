@@ -20,9 +20,18 @@ from leagues.common import cache_exists, cache_read, cache_write, fetch_json
 
 LEAGUE = "BBL"
 
-# Half-court grid -> meters from hoop. Fitted from 2pt/3pt separation:
-# x centered at 140 (lateral), y from baseline, ~17.5 units/m, hoop ~34.
-_X0, _Y0, _K = 140.0, 34.0, 17.5
+# Half-court grid -> meters from hoop. x runs sideline to sideline over
+# 0-280 (the league site draws shots in a 460x280 full-court frame), so
+# 15 m = 280 units. The same scale holds lengthwise, with the baseline at
+# y = 0 and the hoop 1.575 m in front of it. Checked on the court's own
+# lines, every season 2020-21 to 2026-27 (the frame never changed): threes
+# stop at the 6.60 m corner line and the 6.75 m arc as closely as
+# EuroLeague's do, and corner shooters stand as deep as EuroLeague's, GBL's
+# and the WNBA's. The old 17.5 units/m from one 2pt/3pt fit stretched the
+# court by 7%: corner threes at |x| 7.45 m, 3% of shots past the sideline.
+_K = 280 / 15.0
+_X0, _Y0 = 140.0, 1.575 * _K
+_X_MAX = 280  # the far sideline; a shot tapped outside 0.._X_MAX is off court
 
 _SHOT_TYPE = {"TWO_POINT_THROW": 2, "THREE_POINT_THROW": 3}
 _SIMPLE = {
@@ -213,8 +222,12 @@ def normalize_game(season, game):
             "score_away": a.get("guestTeamPoints"),
         })
 
+        # (0,0) is the feed's no-location sentinel, and a tap past the
+        # sideline (15 in 120k shots) is not a position either: both keep
+        # the FGA on the possession side but get no shot row.
         c = a.get("coordinates") or {}
-        if etype == "fg" and (c.get("x") or c.get("y")):
+        if (etype == "fg" and (c.get("x") or c.get("y"))
+                and 0 <= c["x"] <= _X_MAX):
             shots.append({
                 "game_id": gid, "event_id": eid,
                 "player_id": pid, "team_id": team_id,
