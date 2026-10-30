@@ -61,7 +61,8 @@ def export(league):
                 "date": r.date.isoformat(), "fgm": int(r.fgm),
                 "fga": int(r.fga), "pts": int(r.act_fg_pts),
                 "xpts": round(float(r.exp_fg_pts), 1),
-                "oe": round(float(r.oe), 1)}
+                "oe": round(float(r.oe), 1),
+                "gid": str(r.game_id), "season": r.season}
 
     weeks = {}
     for week, w in g.groupby("week"):

@@ -278,7 +278,7 @@ def export_league(league):
             g = pg_grouped.get_group((pid, season))
             entry["games"] = [
                 [int(a), round(float(x), 3), int(n),
-                 *fg_by_key.get((pid, gid, season), (0.0, 0.0))]
+                 *fg_by_key.get((pid, gid, season), (0.0, 0.0)), str(gid)]
                 for a, x, n, gid in zip(g["actual"], g["xfta"], g["poss"],
                                         g["game_id"])
             ]
