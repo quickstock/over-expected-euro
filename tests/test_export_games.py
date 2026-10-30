@@ -300,13 +300,27 @@ def test_a_game_that_misses_its_final_is_left_out_and_counted():
     assert r["excluded"] == 1 and r["why"]["mismatch"] == 1
 
 
-def test_a_forfeit_has_no_events_and_no_date():
-    # ABA 2020-21: awarded 20-0, no team ids, no date, nothing played. Not a game left out: a forfeit.
+@pytest.mark.parametrize("score", [(0, 20), (20, 0), (0, 0)])
+def test_a_game_with_no_events_and_a_forfeit_score_is_a_forfeit(score):
+    # ABA 2020-21: awarded 20-0, no team ids, no date, nothing played; or a postponed game left 0-0.
+    # Not a game left out: a forfeit.
     conn = synthetic_conn()
-    conn.execute("INSERT INTO games VALUES ('g0', 'GBL', ?, '', NULL, NULL, 0, 20, NULL, NULL, NULL)", (SEASON,))
+    conn.execute("INSERT INTO games VALUES ('g0', 'GBL', ?, '', NULL, NULL, ?, ?, NULL, NULL, NULL)",
+                 (SEASON, *score))
     r = run(conn)
     assert r["total"] == 2 and r["forfeits"] == 1 and r["excluded"] == 0 and len(r["rows"]) == 1
-    assert r["why"]["no_shots"] == 0
+    assert r["why"]["no_pbp"] == 0 and r["why"]["no_shots"] == 0
+
+
+def test_a_game_with_no_events_and_a_real_result_is_left_out_as_no_pbp():
+    # LBA 2020-21 game 23071, Milano 86 - Venezia 72, has no play-by-play: a failed events pull would
+    # look the same, so it must reach the left-out gate rather than pass as a forfeit
+    conn = synthetic_conn()
+    conn.execute("INSERT INTO games VALUES ('g0', 'GBL', ?, '2025-10-30', 'AAA', 'BBB', 86, 72, NULL, NULL, NULL)",
+                 (SEASON,))
+    r = run(conn)
+    assert r["total"] == 2 and r["forfeits"] == 0 and r["excluded"] == 1 and r["why"]["no_pbp"] == 1
+    assert [g["id"] for g in r["rows"]] == [GID]
 
 
 def test_a_game_with_free_throws_and_no_shots_is_left_out_not_a_forfeit():

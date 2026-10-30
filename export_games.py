@@ -32,8 +32,11 @@ columns index like any player. Its id starts with "?", which no league's ids do.
 A game is published only when its events rebuild the official final: each side's
 made field goals at their value plus its made free throws must equal the final
 score. A game that does not is left out and counted. A game with no shot events
-and no free-throw events at all was not played (the ABA's 2020-21 awarded 20-0
-forfeits): it is skipped and counted apart, as meta.forfeits, not as left out.
+and no free-throw events at all, whose final is forfeit-shaped (20-0, 0-20 or
+0-0: the ABA's 2020-21 awarded forfeits, a game never played), was not played:
+it is skipped and counted apart, as meta.forfeits, not as left out. A game with
+no events and any other final (a failed events pull looks the same) is left out
+as no_pbp, so the gate sees it.
 
 Gates (exit 1, nothing written):
   * per league-season, no more than max(1% of the games played, 3) left out; the
@@ -84,6 +87,7 @@ XFG_TIE = 0.05                 # a side's player xFgPts may differ from its expe
 ECE_MAX = 0.05
 DECILE_MAX_GAP = 0.08
 DECILE_MIN_N = 100
+FORFEIT_SCORES = ((20, 0), (0, 20), (0, 0))   # finals of a game that was not played
 INTERPOLATED_DATES = ("GBL",)  # leagues whose game dates are not published
 UNATTRIBUTED = {0: "?home", 1: "?away"}   # side -> the id of its "no shooter listed" row
 UNATTRIBUTED_NAME = "Unattributed"
@@ -330,7 +334,7 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
     rows, chunks = [], {}
     wins, home_won = [], []
     xpts_sum = act_sum = 0.0
-    out = {"no_shots": 0, "no_team": 0, "side": 0, "mismatch": 0}
+    out = {"no_pbp": 0, "no_shots": 0, "no_team": 0, "side": 0, "mismatch": 0}
     n_unlocated = n_unattributed = name_fallbacks = forfeits = 0
 
     for g in games.itertuples(index=False):
@@ -338,8 +342,10 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
         if gid not in shots_by_game and gid not in unlocated_by_game:
             if gid in fts_by_game:
                 out["no_shots"] += 1
+            elif (g.home_score, g.away_score) in FORFEIT_SCORES:
+                forfeits += 1      # no events and a forfeit's final: it was not played
             else:
-                forfeits += 1      # no shot and no free throw: it was not played
+                out["no_pbp"] += 1  # a result with no events: the events are missing
             continue
         fts = fts_by_game.get(gid, fts_all.iloc[:0])
         un = unlocated_by_game.get(gid)
