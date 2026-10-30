@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import export_site_data
-from export_games import (anchor_tolerance, cm, export_season, ft_block, league_files, left_out_limit,
+from export_games import (FG_TOL, anchor_tolerance, cm, export_season, ft_block, league_files, left_out_limit,
                           make_rates, official_names, officials, place_unlocated, shooter_sides, shot_block)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -58,11 +58,19 @@ def test_ft_block_is_columnar():
 # --- gates -------------------------------------------------------------------
 
 def test_left_out_limit_is_one_percent_with_a_floor_of_three():
-    assert left_out_limit(380) == 3      # a European season is a few hundred games
-    assert left_out_limit(192) == 3
-    assert left_out_limit(300) == 3
-    assert left_out_limit(400) == 4
-    assert left_out_limit(1189) == 11
+    assert left_out_limit(380, "EL") == 3      # a European season is a few hundred games
+    assert left_out_limit(192, "ABA") == 3
+    assert left_out_limit(300, "WNBA") == 3
+    assert left_out_limit(400, "ACB") == 4
+    assert left_out_limit(1189, "EL") == 11
+
+
+def test_the_gbl_may_leave_out_a_quarter_of_its_games():
+    # its feed drops scoring rows: 6-24% of a season's games cannot rebuild their final
+    assert left_out_limit(141, "GBL") == 35
+    assert left_out_limit(194, "GBL") == 48
+    assert left_out_limit(8, "GBL") == 3
+    assert left_out_limit(141, "ABA") == 3
 
 
 def test_anchor_tolerance_only_loosens_for_the_in_progress_season(monkeypatch):
@@ -207,7 +215,10 @@ def test_export_season_assembles_the_contract():
         "id": GID, "d": None, "wk": "2025-10-27", "h": "AAA", "a": "BBB",
         "hl": "Alpha BC", "al": "BBB", "s": [6, 8], "x": [6.8, 4.8]}
     assert 0 < row["share"] < 1
-    assert r["anchor"] == pytest.approx((9.28 - 12) / 12)
+    # the anchor is the six shots with a model xFG: 6.28 expected against 9 scored; the two imputed
+    # unlocated shots are in every other total
+    assert r["anchor"] == pytest.approx((6.28 - 9) / 9)
+    assert r["forfeits"] == 0
     game = r["chunks"]["2025-10-27"][GID]
     assert set(game) == {"p", "s", "f", "r"}
     # p rows: [pid, name, side, fga, fgPts, xFgPts, fta, ftm], by side then points. 102's two unlocated shots
@@ -236,13 +247,36 @@ def test_league_files_name_an_index_per_season_and_a_chunk_per_week():
     assert set(files) == {f"gameweek-{LG}-2025-10-27.json", f"games-{LG}-{SEASON}.json"}
     index = json.loads(files[f"games-{LG}-{SEASON}.json"])
     assert index["meta"] == {"league": LG, "season": SEASON, "winShare": True, "ece": 0.0412,
-                             "excluded": 0, "games": 1}
+                             "excluded": 0, "forfeits": 0, "games": 1}
     (row,) = index["games"]
     assert row["w"] == int(round(100 * r["rows"][0]["share"])) and "share" not in row
+    assert index["meta"]["forfeits"] == 0
     assert set(json.loads(files[f"gameweek-{LG}-2025-10-27.json"])["games"]) == {GID}
     # a league whose win share failed calibration ships none
     withheld = json.loads(league_files(LG, [r], False, 0.1)[f"games-{LG}-{SEASON}.json"])
     assert withheld["meta"]["winShare"] is False and withheld["games"][0]["w"] is None
+
+
+def test_the_anchor_leaves_out_imputed_shots():
+    # Re-price the six located shots so their expected points equal the 9 they scored exactly
+    # (1.8 + 1.8 + 2.1 + 1.2 + 0.6 + 1.5); players' game lines follow. Both unlocated shots now go in
+    # (final 8-8), and, imputed at the league rate (1.5 + 1.5 expected), 5 scored: with them the season
+    # would sit 14% under its anchor.
+    conn = synthetic_conn()
+    for event, xfg in ((1, 0.9), (2, 0.6), (3, 0.7), (4, 0.6), (5, 0.3), (6, 0.75)):
+        conn.execute("UPDATE shots_xfg SET xfg = ? WHERE event_id = ?", (xfg, event))
+    for player, exp in (("101", 3.6), ("201", 2.1), ("202", 1.8)):
+        conn.execute("UPDATE player_game_shot_value SET exp_fg_pts = ? WHERE player_id = ?", (exp, player))
+    conn.execute("UPDATE events SET shot_made = 1 WHERE event_id = 8")
+    conn.execute("UPDATE games SET home_score = 8 WHERE league = 'GBL'")
+    r = run(conn)
+    assert r["excluded"] == 0 and r["unlocated"] == 2
+    assert r["anchor"] == pytest.approx(0, abs=1e-9)
+    assert abs(r["anchor"]) <= anchor_tolerance(SEASON)
+    # the imputed shots are still in every player line: their points exceed their expected points
+    lines = r["chunks"]["2025-10-27"][GID]["p"]
+    all_in = (sum(p[5] for p in lines) - sum(p[4] for p in lines)) / sum(p[4] for p in lines)
+    assert all_in < -FG_TOL
 
 
 def test_export_season_dates_every_league_but_the_gbl():
@@ -267,11 +301,20 @@ def test_a_game_that_misses_its_final_is_left_out_and_counted():
 
 
 def test_a_forfeit_has_no_events_and_no_date():
-    # ABA 2020-21: awarded 20-0, no team ids, no date, nothing played
+    # ABA 2020-21: awarded 20-0, no team ids, no date, nothing played. Not a game left out: a forfeit.
     conn = synthetic_conn()
     conn.execute("INSERT INTO games VALUES ('g0', 'GBL', ?, '', NULL, NULL, 0, 20, NULL, NULL, NULL)", (SEASON,))
     r = run(conn)
-    assert r["total"] == 2 and r["excluded"] == 1 and r["why"]["no_shots"] == 1 and len(r["rows"]) == 1
+    assert r["total"] == 2 and r["forfeits"] == 1 and r["excluded"] == 0 and len(r["rows"]) == 1
+    assert r["why"]["no_shots"] == 0
+
+
+def test_a_game_with_free_throws_and_no_shots_is_left_out_not_a_forfeit():
+    conn = with_second_game(synthetic_conn())
+    conn.execute("DELETE FROM events WHERE game_id = 'g1' AND etype = 'fg'")
+    conn.execute("DELETE FROM shots WHERE game_id = 'g1'")
+    r = run(conn)
+    assert r["forfeits"] == 0 and r["excluded"] == 1 and r["why"]["no_shots"] == 1
 
 
 def test_events_by_a_team_outside_the_game_leave_it_out():
@@ -307,7 +350,7 @@ def test_a_completed_season_rebuilds_its_finals_and_sits_on_the_anchor():
     shown = official_names(pd.read_sql("SELECT ref1, ref2, ref3 FROM games WHERE league = 'EL'",
                                        export_site_data.conn))
     r = export_season(export_site_data.conn, "EL", season, export_site_data.team_abbrev_map("EL"), shown)
-    assert len(r["rows"]) + r["excluded"] == r["total"]
-    assert r["excluded"] <= left_out_limit(r["total"])
+    assert len(r["rows"]) + r["excluded"] + r["forfeits"] == r["total"]
+    assert r["excluded"] <= left_out_limit(r["total"] - r["forfeits"], "EL")
     assert abs(r["anchor"]) <= anchor_tolerance(season)
     assert r["unlocated"] > 0

@@ -92,21 +92,27 @@ def _aba_club(name):
 
 
 def team_abbrev_map(league):
-    """team_id -> display label. EL, BBL and the Genius LiveStats leagues
-    already carry short team codes as the id; ACB maps clubId via its
-    calendars; LBA and ABA have only sponsored full names, so reduce to
-    the stable club identity."""
+    """team_id -> display label for every team the league has played, home or away.
+    EL, BBL and the Genius LiveStats leagues already carry short team codes as the
+    id; ACB maps clubId via its calendars; LBA and ABA have only sponsored full
+    names, so reduce to the stable club identity (a team's home name wins where
+    its names differ). A team that has so far only played away (the ABA's
+    newcomers) is labelled too, and games with no team ids add nothing."""
     if league in ("LBA", "ABA"):
-        rows = pd.read_sql(
-            "SELECT DISTINCT home_team_id AS t, home_team_name AS n "
-            "FROM games WHERE league = ? AND home_team_name IS NOT NULL",
-            conn, params=(league,))
         fn = _lba_city if league == "LBA" else _aba_club
-        return {r.t: fn(r.n) for r in rows.itertuples()}
+        labels = {}
+        for side in ("away", "home"):
+            rows = pd.read_sql(
+                f"SELECT DISTINCT {side}_team_id AS t, {side}_team_name AS n "
+                f"FROM games WHERE league = ? AND {side}_team_id IS NOT NULL "
+                f"AND {side}_team_name IS NOT NULL", conn, params=(league,))
+            labels.update({r.t: fn(r.n) for r in rows.itertuples()})
+        return labels
     if league != "ACB":
         ids = pd.read_sql(
-            "SELECT DISTINCT home_team_id AS t FROM games WHERE league = ?",
-            conn, params=(league,))
+            "SELECT home_team_id AS t FROM games WHERE league = ? AND home_team_id IS NOT NULL "
+            "UNION SELECT away_team_id FROM games WHERE league = ? AND away_team_id IS NOT NULL",
+            conn, params=(league, league))
         return {t: t for t in ids.t}
     m = {}
     for season in config.SEASONS:

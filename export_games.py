@@ -31,14 +31,20 @@ columns index like any player. Its id starts with "?", which no league's ids do.
 
 A game is published only when its events rebuild the official final: each side's
 made field goals at their value plus its made free throws must equal the final
-score. A game that does not is left out and counted.
+score. A game that does not is left out and counted. A game with no shot events
+and no free-throw events at all was not played (the ABA's 2020-21 awarded 20-0
+forfeits): it is skipped and counted apart, as meta.forfeits, not as left out.
 
 Gates (exit 1, nothing written):
-  * per league-season, no more than max(1% of its games, 3) left out;
+  * per league-season, no more than max(1% of the games played, 3) left out; the
+    GBL's feed drops scoring rows in 6-24% of its games, so its limit is 25%;
   * per league-season, expected FG points within 0.5% of actual FG points (2% for
     the in-progress season, config.SEASONS[-1]: the anchor is on makes, not
     points, so a season a few games old drifts in points while every completed
-    season sits inside 0.5%).
+    season sits inside 0.5%). The anchor measures the shots that have a model xFG:
+    unlocated shots carry an imputed league rate instead (and are nearly all made,
+    which would bias it), so they stay in every total and player line but out of
+    the anchor.
 Calibration of the win share is per league, pooled over its seasons, and not a
 failure: when the ECE is not under 0.05, or a decile with 100+ games is more than
 8 points from its mean, the league's win share is withheld (meta.winShare false,
@@ -71,7 +77,8 @@ from games import calibration, shrunk_ft_pct, side_totals, week_key, win_share
 
 FG_TOL = 0.005                 # |expected - actual| FG points / actual, completed seasons
 FG_TOL_IN_PROGRESS = 0.02
-LEFT_OUT_PERCENT = 1           # a season may leave out this share of its games ...
+LEFT_OUT_PERCENT = {"GBL": 25}   # a season may leave out this share of its games (1% unless listed) ...
+LEFT_OUT_PERCENT_DEFAULT = 1
 LEFT_OUT_MIN = 3               # ... but never fewer than this many
 XFG_TIE = 0.05                 # a side's player xFgPts may differ from its expected FG points by this much
 ECE_MAX = 0.05
@@ -135,9 +142,10 @@ def anchor_tolerance(season: str) -> float:
     return FG_TOL_IN_PROGRESS if season == config.SEASONS[-1] else FG_TOL
 
 
-def left_out_limit(n_games: int) -> int:
-    """The most games a season may leave out: 1% of its games, never fewer than three."""
-    return max(n_games * LEFT_OUT_PERCENT // 100, LEFT_OUT_MIN)
+def left_out_limit(n_games: int, league: str) -> int:
+    """The most games a season may leave out: 1% of its games played (25% for the GBL,
+    whose feed drops scoring rows), never fewer than three."""
+    return max(n_games * LEFT_OUT_PERCENT.get(league, LEFT_OUT_PERCENT_DEFAULT) // 100, LEFT_OUT_MIN)
 
 
 def shooter_sides(sh: pd.DataFrame, fts: pd.DataFrame) -> "dict | None":
@@ -288,7 +296,7 @@ def load_events(conn, league: str, season: str, located: pd.DataFrame,
 def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> dict:
     """Everything a league-season publishes except the win-share-dependent fields:
     index rows (win share unrounded), chunk entries by week, and the sums the gates
-    read. abbrev is team_abbrev_map(league), shown official_names of the league's games."""
+    read (the FG anchor over the shots that have a model xFG). abbrev is team_abbrev_map(league), shown official_names of the league's games."""
     games = pd.read_sql(
         "SELECT game_id, date, home_team_id, away_team_id, home_score, away_score, ref1, ref2, ref3 "
         "FROM games WHERE league = ? AND season = ? ORDER BY date, game_id",
@@ -323,12 +331,15 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
     wins, home_won = [], []
     xpts_sum = act_sum = 0.0
     out = {"no_shots": 0, "no_team": 0, "side": 0, "mismatch": 0}
-    n_unlocated = n_unattributed = name_fallbacks = 0
+    n_unlocated = n_unattributed = name_fallbacks = forfeits = 0
 
     for g in games.itertuples(index=False):
         gid, home, away = g.game_id, g.home_team_id, g.away_team_id
         if gid not in shots_by_game and gid not in unlocated_by_game:
-            out["no_shots"] += 1
+            if gid in fts_by_game:
+                out["no_shots"] += 1
+            else:
+                forfeits += 1      # no shot and no free throw: it was not played
             continue
         fts = fts_by_game.get(gid, fts_all.iloc[:0])
         un = unlocated_by_game.get(gid)
@@ -337,6 +348,7 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
             continue
 
         sh = shots_by_game.get(gid, located.iloc[:0][SHOT_COLS])
+        priced = sh        # the shots with a model xFG: the anchor's
         extra = sh[sh["player_id"].isin(UNATTRIBUTED.values())]    # pgsv holds no shooterless shots
         if un is not None:
             extra = pd.concat([extra, un])
@@ -357,8 +369,8 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
         if pd.isna(g.date):
             raise ValueError(f"{league} {gid}: a game that rebuilds its final has no date")
 
-        xpts_sum += float(sh["xpts"].sum())
-        act_sum += tot[0]["fg"] + tot[1]["fg"]
+        xpts_sum += float(priced["xpts"].sum())
+        act_sum += float((priced["value"] * priced["made"]).sum())
         n_unlocated += 0 if un is None else len(un)
         n_unattributed += int(sh["player_id"].isin(UNATTRIBUTED.values()).sum())
         share = win_share(sh, fts, seed=zlib.crc32(f"{league}{gid}".encode()))
@@ -390,7 +402,8 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
     excluded = sum(out.values())
     return {
         "season": season, "rows": rows, "chunks": chunks, "wins": wins, "home_won": home_won,
-        "excluded": excluded, "why": out, "total": len(games), "name_fallbacks": name_fallbacks,
+        "excluded": excluded, "why": out, "total": len(games), "forfeits": forfeits,
+        "name_fallbacks": name_fallbacks,
         "unlocated": n_unlocated, "unattributed": n_unattributed,
         "anchor": (xpts_sum - act_sum) / act_sum,
     }
@@ -406,7 +419,8 @@ def league_files(league: str, results: list, ok: bool, ece: float) -> dict:
     for r in results:
         files[f"games-{league}-{r['season']}.json"] = dump({
             "meta": {"league": league, "season": r["season"], "winShare": ok,
-                     "ece": round(ece, 4), "excluded": r["excluded"], "games": len(r["rows"])},
+                     "ece": round(ece, 4), "excluded": r["excluded"], "forfeits": r["forfeits"],
+                     "games": len(r["rows"])},
             "games": [{**{k: v for k, v in g.items() if k != "share"},
                        "w": int(round(100 * g["share"])) if ok else None} for g in r["rows"]],
         })
@@ -437,18 +451,21 @@ def main(argv=None) -> int:
         for s in seasons:
             r = export_season(conn, league, s, abbrev, shown)
             results.append(r)
-            frac = r["excluded"] / r["total"]
+            played = r["total"] - r["forfeits"]
+            frac = r["excluded"] / played
             tol = anchor_tolerance(s)
             why = ", ".join(f"{k} {v}" for k, v in r["why"].items() if v)
             print(f"{league} {s}: {len(r['rows'])} games, {r['excluded']} excluded ({frac:.2%})"
-                  f"{' [' + why + ']' if why else ''}, FG anchor {r['anchor']:+.2%}"
+                  f"{' [' + why + ']' if why else ''}"
+                  f"{', forfeits ' + str(r['forfeits']) if r['forfeits'] else ''}"
+                  f", FG anchor {r['anchor']:+.2%}"
                   f"{', unlocated shots ' + str(r['unlocated']) if r['unlocated'] else ''}"
                   f"{', no shooter on ' + str(r['unattributed']) + ' shots' if r['unattributed'] else ''}"
                   f"{', names from events ' + str(r['name_fallbacks']) if r['name_fallbacks'] else ''}",
                   flush=True)
-            if r["excluded"] > left_out_limit(r["total"]):
-                failures.append(f"{league} {s}: {r['excluded']} of {r['total']} games left out "
-                                f"(limit {left_out_limit(r['total'])})")
+            if r["excluded"] > left_out_limit(played, league):
+                failures.append(f"{league} {s}: {r['excluded']} of {played} games left out "
+                                f"(limit {left_out_limit(played, league)})")
             if abs(r["anchor"]) > tol:
                 failures.append(f"{league} {s}: FG anchor {r['anchor']:+.2%} outside +-{tol:.1%}")
 
