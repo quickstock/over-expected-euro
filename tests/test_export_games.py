@@ -10,8 +10,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 import export_site_data
-from export_games import (FG_TOL, anchor_tolerance, cm, export_season, ft_block, league_files, left_out_limit,
-                          make_rates, official_names, officials, place_unlocated, shooter_sides, shot_block)
+from export_games import (FG_TOL, anchor_failure, anchor_tolerance, cm, export_season, ft_block, league_files, left_out_limit,
+                          make_rates, official_names, officials, place_unlocated, player_lines, shooter_sides, shot_block)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -76,8 +76,27 @@ def test_the_gbl_may_leave_out_a_quarter_of_its_games():
 def test_anchor_tolerance_only_loosens_for_the_in_progress_season(monkeypatch):
     monkeypatch.setattr(config, "SEASONS", ["2024-25", "2025-26", "2026-27"])
     assert anchor_tolerance("2026-27") == 0.02
-    assert anchor_tolerance("2025-26") == 0.005
-    assert anchor_tolerance("2024-25") == 0.005
+    assert anchor_tolerance("2025-26") == 0.01
+    assert anchor_tolerance("2024-25") == 0.01
+
+
+def test_the_anchor_gate_needs_100_games_and_bars_1_or_2_percent(monkeypatch):
+    # ruling 22: under 100 included games (an empty season included) the anchor is not gated
+    monkeypatch.setattr(config, "SEASONS", ["2024-25", "2025-26", "2026-27"])
+    assert anchor_failure("2025-26", 99, 0.05) is None
+    assert anchor_failure("2025-26", 0, None) is None
+    assert anchor_failure("2025-26", 100, 0.0099) is None
+    assert anchor_failure("2025-26", 100, -0.011) == "FG anchor -1.10% outside +-1%"
+    assert anchor_failure("2026-27", 150, 0.019) is None
+    assert anchor_failure("2026-27", 150, 0.021) == "FG anchor +2.10% outside +-2%"
+
+
+def test_a_season_with_no_included_games_returns_empty_and_does_not_raise():
+    conn = synthetic_conn()
+    conn.execute("UPDATE games SET home_score = 7 WHERE league = 'GBL'")   # its one game misses its final
+    r = run(conn)
+    assert r["rows"] == [] and r["chunks"] == {} and r["excluded"] == 1 and r["anchor"] is None
+    assert anchor_failure(SEASON, 0, r["anchor"]) is None
 
 
 # --- helpers ------------------------------------------------------------------
@@ -368,3 +387,15 @@ def test_a_completed_season_rebuilds_its_finals_and_sits_on_the_anchor():
     assert r["excluded"] <= left_out_limit(r["total"] - r["forfeits"], "EL")
     assert abs(r["anchor"]) <= anchor_tolerance(season)
     assert r["unlocated"] > 0
+
+
+def test_player_lines_must_rebuild_the_official_final():
+    sh = pd.DataFrame({"player_id": ["101", "201"]})
+    fts = pd.DataFrame({"pid": ["101"], "made": [True]})
+    pgsv = pd.DataFrame({"player_id": ["101", "201"], "fga": [1, 1], "act_fg_pts": [2.0, 3.0],
+                         "exp_fg_pts": [1.0, 1.1]})
+    args = ("g1", sh, None, fts, pgsv, {"101": 0, "201": 1}, {"101": "A", "201": "B"}, {}, {0: 1.0, 1: 1.1})
+    players, _ = player_lines(*args, (3, 3))
+    assert [p[0] for p in players] == ["101", "201"]
+    with pytest.raises(ValueError, match="g1: side 1 players' FG points \\+ FTM 3 differ from the official final 4"):
+        player_lines(*args, (3, 4))

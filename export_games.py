@@ -41,13 +41,19 @@ as no_pbp, so the gate sees it.
 Gates (exit 1, nothing written):
   * per league-season, no more than max(1% of the games played, 3) left out; the
     GBL's feed drops scoring rows in 6-24% of its games, so its limit is 25%;
-  * per league-season, expected FG points within 0.5% of actual FG points (2% for
+  * per league-season, expected FG points within 1% of actual FG points (2% for
     the in-progress season, config.SEASONS[-1]: the anchor is on makes, not
-    points, so a season a few games old drifts in points while every completed
-    season sits inside 0.5%). The anchor measures the shots that have a model xFG:
-    unlocated shots carry an imputed league rate instead (and are nearly all made,
-    which would bias it), so they stay in every total and player line but out of
-    the anchor.
+    points, so a season a few games old drifts in points). The gate applies only
+    to a league-season with at least 100 included games (ruling 22): xFG
+    calibration is gated upstream (validate.py), this gate catches gross
+    breakage, and sample noise in a short season must not block a deploy. A
+    season with no included games prints a line and writes an empty index. The
+    anchor measures the shots that have a model xFG: unlocated shots carry an
+    imputed league rate instead (and are nearly all made, which would bias it),
+    so they stay in every total and player line but out of the anchor.
+Every published game's player lines rebuild its final: per side, the players'
+FG points plus their made free throws equal the official score (the generator
+checks the same identity; the exporter raises on a game that breaks it).
 Calibration of the win share is per league, pooled over its seasons, and not a
 failure: when the ECE is not under 0.05, or a decile with 100+ games is more than
 8 points from its mean, the league's win share is withheld (meta.winShare false,
@@ -78,8 +84,9 @@ import config
 from export_site_data import OUT_DIR, conn, ref_key, team_abbrev_map
 from games import calibration, shrunk_ft_pct, side_totals, week_key, win_share
 
-FG_TOL = 0.005                 # |expected - actual| FG points / actual, completed seasons
+FG_TOL = 0.01                  # |expected - actual| FG points / actual, completed seasons
 FG_TOL_IN_PROGRESS = 0.02
+ANCHOR_MIN_GAMES = 100         # the anchor gate applies only to seasons with this many included games
 LEFT_OUT_PERCENT = {"GBL": 25}   # a season may leave out this share of its games (1% unless listed) ...
 LEFT_OUT_PERCENT_DEFAULT = 1
 LEFT_OUT_MIN = 3               # ... but never fewer than this many
@@ -141,9 +148,26 @@ def ft_block(fts: pd.DataFrame, idx: dict) -> dict:
 
 
 def anchor_tolerance(season: str) -> float:
-    """How far a season's expected FG points may sit from its actual FG points: 0.5%,
+    """How far a season's expected FG points may sit from its actual FG points: 1%,
     or 2% for the in-progress season (the anchor is on makes, not points)."""
     return FG_TOL_IN_PROGRESS if season == config.SEASONS[-1] else FG_TOL
+
+
+def anchor_failure(season: str, n_games: int, anchor: "float | None") -> "str | None":
+    """Why a season fails the FG anchor gate, or None when it passes or the gate does not
+    apply: under ANCHOR_MIN_GAMES included games (anchor None when there are none)."""
+    if n_games < ANCHOR_MIN_GAMES:
+        return None
+    tol = anchor_tolerance(season)
+    return f"FG anchor {anchor:+.2%} outside +-{tol:.0%}" if abs(anchor) > tol else None
+
+
+def anchor_note(n_games: int, anchor: "float | None") -> str:
+    """The FG anchor as the season's progress line prints it."""
+    if anchor is None:
+        return "no FG anchor (no included games)"
+    gated = "" if n_games >= ANCHOR_MIN_GAMES else f" (not gated: {n_games} games < {ANCHOR_MIN_GAMES})"
+    return f"FG anchor {anchor:+.2%}{gated}"
 
 
 def left_out_limit(n_games: int, league: str) -> int:
@@ -187,13 +211,15 @@ def officials(refs, shown: dict) -> list:
 
 def player_lines(gid: str, sh: pd.DataFrame, extra: "pd.DataFrame | None", fts: pd.DataFrame,
                  pgsv: "pd.DataFrame | None", side_of: dict, names: dict, event_names: dict,
-                 expected_fg: dict) -> tuple[list, int]:
+                 expected_fg: dict, final: tuple) -> tuple[list, int]:
     """A game's [pid, name, side, fga, fgPts, xFgPts, fta, ftm] rows, and how many names
     came from the events. FG numbers start from player_game_shot_value (pgsv; the form
     chart's), plus the shots it does not hold (extra: the unlocated ones and those with no
     shooter) at their xpts; free throws from the events. Everyone in the game's shots or
     free throws gets a row. Raises when a side's xFgPts do not add up to expected_fg[side],
-    the expected FG points its shots are worth."""
+    the expected FG points its shots are worth, or when a side's FG points plus made free
+    throws are not final[side], its official score (the identity the site generator's
+    sideLines() asserts)."""
     line = {}
     if pgsv is not None:
         for r in pgsv.itertuples():
@@ -215,6 +241,10 @@ def player_lines(gid: str, sh: pd.DataFrame, extra: "pd.DataFrame | None", fts: 
         if abs(got - expected_fg[side]) > XFG_TIE:
             raise ValueError(f"{gid}: side {side} players' expected FG points {got:.3f} "
                              f"differ from the side's {expected_fg[side]:.3f}")
+        scored = sum(row[1] + row[4] for pid, row in line.items() if side_of[pid] == side)
+        if scored != final[side]:
+            raise ValueError(f"{gid}: side {side} players' FG points + FTM {scored} "
+                             f"differ from the official final {final[side]}")
     players, fallbacks = [], 0
     for pid, (fga, pts, xpts, fta, ftm) in line.items():
         if pid in names:
@@ -385,7 +415,7 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
 
         players, fallbacks = player_lines(
             gid, sh, extra if len(extra) else None, fts, lines_by_game.get(gid), side_of, names,
-            event_names, {0: tot[0]["xfg"], 1: tot[1]["xfg"]})
+            event_names, {0: tot[0]["xfg"], 1: tot[1]["xfg"]}, (hs, as_))
         name_fallbacks += fallbacks
         idx = {p[0]: i for i, p in enumerate(players)}
 
@@ -403,15 +433,13 @@ def export_season(conn, league: str, season: str, abbrev: dict, shown: dict) -> 
             "share": share,
         })
 
-    if not rows:
-        raise ValueError(f"{league} {season}: none of its {len(games)} games rebuilds its final ({out})")
     excluded = sum(out.values())
     return {
         "season": season, "rows": rows, "chunks": chunks, "wins": wins, "home_won": home_won,
         "excluded": excluded, "why": out, "total": len(games), "forfeits": forfeits,
         "name_fallbacks": name_fallbacks,
         "unlocated": n_unlocated, "unattributed": n_unattributed,
-        "anchor": (xpts_sum - act_sum) / act_sum,
+        "anchor": (xpts_sum - act_sum) / act_sum if act_sum else None,
     }
 
 
@@ -458,13 +486,15 @@ def main(argv=None) -> int:
             r = export_season(conn, league, s, abbrev, shown)
             results.append(r)
             played = r["total"] - r["forfeits"]
-            frac = r["excluded"] / played
-            tol = anchor_tolerance(s)
+            frac = r["excluded"] / played if played else 0.0
             why = ", ".join(f"{k} {v}" for k, v in r["why"].items() if v)
+            if not r["rows"]:
+                print(f"{league} {s}: no game rebuilds its final ({r['total']} games); "
+                      f"anchor skipped, empty index")
             print(f"{league} {s}: {len(r['rows'])} games, {r['excluded']} excluded ({frac:.2%})"
                   f"{' [' + why + ']' if why else ''}"
                   f"{', forfeits ' + str(r['forfeits']) if r['forfeits'] else ''}"
-                  f", FG anchor {r['anchor']:+.2%}"
+                  f", {anchor_note(len(r['rows']), r['anchor'])}"
                   f"{', unlocated shots ' + str(r['unlocated']) if r['unlocated'] else ''}"
                   f"{', no shooter on ' + str(r['unattributed']) + ' shots' if r['unattributed'] else ''}"
                   f"{', names from events ' + str(r['name_fallbacks']) if r['name_fallbacks'] else ''}",
@@ -472,8 +502,9 @@ def main(argv=None) -> int:
             if r["excluded"] > left_out_limit(played, league):
                 failures.append(f"{league} {s}: {r['excluded']} of {played} games left out "
                                 f"(limit {left_out_limit(played, league)})")
-            if abs(r["anchor"]) > tol:
-                failures.append(f"{league} {s}: FG anchor {r['anchor']:+.2%} outside +-{tol:.1%}")
+            anchor_fail = anchor_failure(s, len(r["rows"]), r["anchor"])
+            if anchor_fail:
+                failures.append(f"{league} {s}: {anchor_fail}")
 
         win = np.array([w for r in results for w in r["wins"]])
         won = np.array([w for r in results for w in r["home_won"]])
